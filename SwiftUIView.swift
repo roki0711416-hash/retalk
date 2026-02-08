@@ -21,9 +21,9 @@ struct WebView: UIViewRepresentable {
 struct SwiftUIView: View {
     var body: some View {
         WebView(
-            url: URL(string: "https://YOUR_DOMAIN/miteru")!
+            url: URL(string: "https://retalk-tau.vercel.app")!
         )
-        .ignoresSafeArea() // 画面全体に表示
+        .ignoresSafeArea()
     }
 }
 

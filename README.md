@@ -10,7 +10,43 @@ This project uses the OpenAI Responses API server-side in `/api/miteru/analyze`.
 
 ```bash
 OPENAI_API_KEY=your_key_here
+# Optional (cost-first defaults are used if omitted)
+# OPENAI_MODEL=gpt-4o-mini
+# OPENAI_VISION_MODEL=gpt-4o-mini
 ```
+
+## MVP: Screenshot → Diagnosis
+
+### How to use
+
+1) Start dev server:
+
+```bash
+npm run dev
+```
+
+2) Open the analyzer page:
+
+- `http://localhost:3000/miteru/analyze`
+
+3) Upload LINE chat screenshots:
+
+- png/jpg
+- up to 10 images
+- total up to 20MB (processed in memory only; not saved)
+
+4) Click "解析を始める" to get a strict JSON result:
+
+- `score` (0-100)
+- `summary`
+- `red_flags` (string[])
+- `advice` (string[])
+
+### API
+
+- `POST /api/miteru/analyze-image` (multipart/form-data)
+	- field name: `images` (multiple)
+	- rate limit (simple in-memory): 12 requests / 5 minutes per IP
 
 2) Example request (metrics only; do not send raw talk logs):
 

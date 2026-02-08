@@ -1,17 +1,20 @@
 import { NextResponse } from "next/server";
 
-import { generateMiteruAnalysis } from "@/lib/miteru/analyze";
+import { generateMiteruMetricsFromTranscript } from "@/lib/miteru/analyze";
 
 export const runtime = "nodejs";
 
-type VisionExtract = {
-  left_count: number;
-  right_count: number;
-  samples: {
-    left: string[];
-    right: string[];
-  };
-  sentiment: "positive" | "neutral" | "negative";
+const MAX_FILES = 10;
+const MAX_TOTAL_BYTES = 20 * 1024 * 1024;
+const MAX_FILE_BYTES = 8 * 1024 * 1024;
+const ALLOWED_TYPES = new Set(["image/png", "image/jpeg"]);
+
+const RATE_LIMIT_WINDOW_MS = 5 * 60 * 1000;
+const RATE_LIMIT_MAX = 12;
+const rateLimitStore = new Map<string, { count: number; resetAt: number }>();
+
+type VisionTextExtract = {
+  conversation_text: string;
 };
 
 function isPlainObject(value: unknown): value is Record<string, unknown> {
@@ -40,92 +43,123 @@ function extractOutputText(data: unknown): string | null {
   return textParts.length ? textParts.join("\n") : null;
 }
 
-function coerceVisionExtract(value: unknown): VisionExtract {
+function coerceVisionTextExtract(value: unknown): VisionTextExtract {
   if (!isPlainObject(value)) throw new Error("Vision output is not a JSON object");
-
-  const left_count = value.left_count;
-  const right_count = value.right_count;
-  const samples = value.samples;
-  const sentiment = value.sentiment;
-
-  if (typeof left_count !== "number" || !Number.isFinite(left_count) || left_count < 0)
-    throw new Error("Invalid left_count");
-  if (typeof right_count !== "number" || !Number.isFinite(right_count) || right_count < 0)
-    throw new Error("Invalid right_count");
-  if (!isPlainObject(samples)) throw new Error("Invalid samples");
-  const left = samples.left;
-  const right = samples.right;
-  if (!Array.isArray(left) || !left.every((x) => typeof x === "string")) throw new Error("Invalid samples.left");
-  if (!Array.isArray(right) || !right.every((x) => typeof x === "string"))
-    throw new Error("Invalid samples.right");
-  if (sentiment !== "positive" && sentiment !== "neutral" && sentiment !== "negative")
-    throw new Error("Invalid sentiment");
-
-  return {
-    left_count: Math.round(left_count),
-    right_count: Math.round(right_count),
-    samples: {
-      left: left.map((s) => s.trim()).filter(Boolean).slice(0, 12),
-      right: right.map((s) => s.trim()).filter(Boolean).slice(0, 12),
-    },
-    sentiment,
-  };
+  const conversation_text = value.conversation_text;
+  if (typeof conversation_text !== "string" || conversation_text.trim().length === 0)
+    throw new Error("Invalid conversation_text");
+  return { conversation_text: conversation_text.trim() };
 }
 
-function computeSimpleMetrics(extract: VisionExtract): Record<string, unknown> {
-  const message_count = extract.left_count + extract.right_count;
-  const msg_ratio = message_count === 0 ? 0.5 : extract.right_count / message_count;
-  const sentiment_trend =
-    extract.sentiment === "positive" ? "pos" : extract.sentiment === "negative" ? "neg" : "neutral";
+function jsonError(status: number, error: string, details?: unknown) {
+  return NextResponse.json({ error, details }, { status });
+}
 
-  return {
-    msg_ratio,
-    message_count,
-    sentiment_trend,
-  };
+function getClientIp(request: Request): string {
+  const xf = request.headers.get("x-forwarded-for");
+  if (xf) return xf.split(",")[0]?.trim() || "unknown";
+  return request.headers.get("x-real-ip") || "unknown";
+}
+
+function checkRateLimit(ip: string): { ok: true } | { ok: false; retryAfterSec: number } {
+  const now = Date.now();
+  const entry = rateLimitStore.get(ip);
+  if (!entry || entry.resetAt <= now) {
+    rateLimitStore.set(ip, { count: 1, resetAt: now + RATE_LIMIT_WINDOW_MS });
+    return { ok: true };
+  }
+  if (entry.count >= RATE_LIMIT_MAX) {
+    return { ok: false, retryAfterSec: Math.max(1, Math.ceil((entry.resetAt - now) / 1000)) };
+  }
+  entry.count += 1;
+  return { ok: true };
 }
 
 export async function POST(request: Request) {
   const apiKey = process.env.OPENAI_API_KEY;
   if (!apiKey) {
-    return NextResponse.json({ error: "OPENAI_API_KEY is not set" }, { status: 500 });
+    return jsonError(500, "OPENAI_API_KEY is not set");
+  }
+
+  const ip = getClientIp(request);
+  const rl = checkRateLimit(ip);
+  if (!rl.ok) {
+    return NextResponse.json(
+      { error: "Rate limit exceeded", details: { retry_after_sec: rl.retryAfterSec } },
+      {
+        status: 429,
+        headers: {
+          "Retry-After": String(rl.retryAfterSec),
+        },
+      },
+    );
+  }
+
+  const contentLength = request.headers.get("content-length");
+  if (contentLength) {
+    const n = Number(contentLength);
+    if (Number.isFinite(n) && n > MAX_TOTAL_BYTES + 64 * 1024) {
+      return jsonError(413, "Request too large", { max_total_bytes: MAX_TOTAL_BYTES });
+    }
   }
 
   let formData: FormData;
   try {
     formData = await request.formData();
   } catch {
-    return NextResponse.json({ error: "Expected multipart/form-data" }, { status: 400 });
+    return jsonError(400, "Expected multipart/form-data");
   }
 
-  const file = formData.get("image");
-  if (!(file instanceof File)) {
-    return NextResponse.json({ error: "image file is required" }, { status: 400 });
+  const files = formData.getAll("images").filter((x): x is File => x instanceof File);
+  if (files.length === 0) {
+    return jsonError(400, 'images files are required (field name: "images")');
+  }
+  if (files.length > MAX_FILES) {
+    return jsonError(413, "Too many images", { max_files: MAX_FILES });
   }
 
-  const allowed = new Set(["image/png", "image/jpeg"]);
-  if (!allowed.has(file.type)) {
-    return NextResponse.json({ error: "Only png/jpg images are allowed" }, { status: 400 });
+  let totalBytes = 0;
+  for (const file of files) {
+    if (!ALLOWED_TYPES.has(file.type)) {
+      return jsonError(400, "Only png/jpg images are allowed", { file_type: file.type });
+    }
+    if (file.size > MAX_FILE_BYTES) {
+      return jsonError(413, "Image is too large", { max_file_bytes: MAX_FILE_BYTES });
+    }
+    totalBytes += file.size;
+  }
+  if (totalBytes > MAX_TOTAL_BYTES) {
+    return jsonError(413, "Total image size is too large", { max_total_bytes: MAX_TOTAL_BYTES });
   }
 
-  const maxBytes = 6 * 1024 * 1024;
-  if (file.size > maxBytes) {
-    return NextResponse.json({ error: "Image is too large (max 6MB)" }, { status: 413 });
+  const dataUrls: string[] = [];
+  for (const file of files) {
+    const buffer = Buffer.from(await file.arrayBuffer());
+    dataUrls.push(`data:${file.type};base64,${buffer.toString("base64")}`);
   }
-
-  // Read into memory only; do not persist.
-  const buffer = Buffer.from(await file.arrayBuffer());
-  const dataUrl = `data:${file.type};base64,${buffer.toString("base64")}`;
 
   const visionSystem =
-    "You extract information from a chat screenshot for a lightweight analysis. " +
-    "Return ONLY valid JSON with EXACT keys: left_count, right_count, samples, sentiment. " +
-    "samples must be {left: string[], right: string[]} containing short text snippets (not full transcript). " +
-    "sentiment must be one of: positive, neutral, negative. " +
-    "Do not include any additional keys.";
+    "You are an OCR + structuring tool for LINE chat screenshots. " +
+    "Return ONLY valid JSON with EXACT key: conversation_text. " +
+    "conversation_text must be a plain text transcript, one message per line, prefixed with speaker label like 'A:' or 'B:'. " +
+    "Keep ordering as best-effort (top-to-bottom, across images in given order). " +
+    "Do not include any extra keys.";
 
   const visionUser =
-    "From this screenshot, estimate bubble counts by side (left/right), capture a few short message snippets per side, and judge overall sentiment vibe.";
+    "Extract the conversation text from these screenshots. If some text is unreadable, omit it or mark as '[unreadable]'.";
+
+  const visionSchema = {
+    name: "miteru_vision_extract",
+    strict: true,
+    schema: {
+      type: "object",
+      additionalProperties: false,
+      properties: {
+        conversation_text: { type: "string" },
+      },
+      required: ["conversation_text"],
+    },
+  };
 
   const visionResponse = await fetch("https://api.openai.com/v1/responses", {
     method: "POST",
@@ -134,8 +168,9 @@ export async function POST(request: Request) {
       "Content-Type": "application/json",
     },
     body: JSON.stringify({
-      model: process.env.OPENAI_VISION_MODEL || "gpt-4.1-mini",
+      model: process.env.OPENAI_VISION_MODEL || "gpt-4o-mini",
       store: false,
+      response_format: { type: "json_schema", json_schema: visionSchema },
       input: [
         {
           role: "system",
@@ -145,7 +180,7 @@ export async function POST(request: Request) {
           role: "user",
           content: [
             { type: "text", text: visionUser },
-            { type: "input_image", image_url: dataUrl },
+            ...dataUrls.map((u) => ({ type: "input_image", image_url: u })),
           ],
         },
       ],
@@ -154,55 +189,42 @@ export async function POST(request: Request) {
 
   if (!visionResponse.ok) {
     const errText = await visionResponse.text().catch(() => "");
-    return NextResponse.json(
-      { error: "OpenAI vision request failed", details: errText || undefined },
-      { status: 502 },
-    );
+    return jsonError(502, "OpenAI vision request failed", errText || undefined);
   }
 
   const visionData = (await visionResponse.json()) as unknown;
   const outputText = extractOutputText(visionData);
   if (!outputText) {
-    return NextResponse.json({ error: "Failed to read vision output" }, { status: 502 });
+    return jsonError(502, "Failed to read vision output");
   }
 
   let extractedUnknown: unknown;
   try {
     extractedUnknown = JSON.parse(outputText) as unknown;
   } catch {
-    return NextResponse.json({ error: "Vision output was not valid JSON" }, { status: 502 });
+    return jsonError(502, "Vision output was not valid JSON");
   }
 
-  let extract: VisionExtract;
+  let extract: VisionTextExtract;
   try {
-    extract = coerceVisionExtract(extractedUnknown);
+    extract = coerceVisionTextExtract(extractedUnknown);
   } catch (e) {
-    return NextResponse.json(
-      {
-        error: "Failed to extract screenshot info",
-        details: e instanceof Error ? e.message : "Unknown error",
-      },
-      { status: 502 },
-    );
+    return jsonError(502, "Failed to extract conversation text", e instanceof Error ? e.message : "Unknown error");
   }
 
-  const metrics = computeSimpleMetrics(extract);
-
   try {
-    const result = await generateMiteruAnalysis({ apiKey, metrics });
+    const metrics = await generateMiteruMetricsFromTranscript({ apiKey, transcript: extract.conversation_text });
     return NextResponse.json({
-      score: result.score,
-      relationship_type: result.relationship_type,
-      outlook: result.outlook,
-      summary: result.summary,
+      metrics,
+      transcript: extract.conversation_text,
+      debug: {
+        image_count: files.length,
+        total_bytes: totalBytes,
+        vision_model: process.env.OPENAI_VISION_MODEL || "gpt-4o-mini",
+        model: process.env.OPENAI_MODEL || "gpt-4o-mini",
+      },
     });
   } catch (e) {
-    return NextResponse.json(
-      {
-        error: "Analyze failed",
-        details: e instanceof Error ? e.message : "Unknown error",
-      },
-      { status: 502 },
-    );
+    return jsonError(502, "Analyze failed", e instanceof Error ? e.message : "Unknown error");
   }
 }
