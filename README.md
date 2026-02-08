@@ -2,6 +2,24 @@ This is a [Next.js](https://nextjs.org) project bootstrapped with [`create-next-
 
 ## Getting Started
 
+## OpenAI (Responses API)
+
+This project uses the OpenAI Responses API server-side in `/api/miteru/analyze`.
+
+1) Set env var in `.env.local`:
+
+```bash
+OPENAI_API_KEY=your_key_here
+```
+
+2) Example request (metrics only; do not send raw talk logs):
+
+```bash
+curl -s http://localhost:3000/api/miteru/analyze \
+	-H 'Content-Type: application/json' \
+	-d '{"metrics":{"reply_rate":0.72,"avg_response_minutes":18,"positivity":0.63,"conflict_rate":0.08}}' | jq
+```
+
 First, run the development server:
 
 ```bash
